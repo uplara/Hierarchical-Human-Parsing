@@ -173,6 +173,7 @@ def create_dataset(parse_func, filter_func, tfrecord_path, num_data, batch_size,
 
     elif mode == "val":
         dataset = dataset.skip(int(data_split * num_data))
+        dataset = dataset.take(int((1-data_split)*num_data))
 
     elif mode == "k_worst":
         dataset = dataset.take(data_split * num_data)
