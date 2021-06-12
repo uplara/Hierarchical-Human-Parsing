@@ -45,6 +45,7 @@ def parse_args():
     parser.add_argument('--lr-mode', type=str, default='poly')
     parser.add_argument('--ignore-label', type=int, default=255)
     # Checkpoints
+    parser.add_argument('--start_epoch', type=int, default=0)
     parser.add_argument('--restore_from', default='gs://vinit_helper/grapy/hierarchical_human_parsing/exp_v2/baseline64_miou.pth', type=str, help='provide google cloud link')
     parser.add_argument('--snapshot_dir', type=str, default='./checkpoints/exp/')
     parser.add_argument('--exp_path', type=str, default='gs://vinit_helper/grapy/hierarchical_human_parsing/exp_v2')
@@ -128,7 +129,7 @@ def main(args):
             os.makedirs(valpath)
         validation(model, valset, 0, args.batch_size, valset_length, valpath, exp_path)
     else:
-        for epoch in range(0, args.epochs):
+        for epoch in range(args.start_epoch, args.epochs):
             print('\n{} | {}'.format(epoch, args.epochs - 1))
             # training
             _ = train(model, trainset, epoch, criterion, optimizer, writer, args.batch_size, trainset_length)

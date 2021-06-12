@@ -186,8 +186,8 @@ def create_dataset(parse_func, filter_func, tfrecord_path, num_data, batch_size,
     dataset = dataset.filter(filter_func)
 
     if mode != "k_worst":
-        # num_lines = sum(1 for _ in dataset)
-        num_lines = 15000
+        num_lines = sum(1 for _ in dataset)
+        # num_lines = 15000
         dataset = dataset.repeat()
         dataset = dataset.batch(batch_size, drop_remainder=True)
     else:
