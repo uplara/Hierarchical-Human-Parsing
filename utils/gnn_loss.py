@@ -190,7 +190,7 @@ class gnn_loss_noatt(nn.Module):
 
         self.ignore_index = ignore_index
         self.only_present = only_present
-        self.weight = torch.FloatTensor([0.82877791, 0.95688253, 0.94921949, 1.00538108, 1.0201687,  1.01665831, 1.05470914])
+        self.weight = torch.FloatTensor([0.82877791, 0.95688253, 0.94921949, 1.00538108, 1.0201687,  1.01665831, 1.05470914]).cuda()
         self.criterion = torch.nn.CrossEntropyLoss(ignore_index=ignore_index, weight=self.weight)
 
         self.upper_part_list = upper_part_list
@@ -200,7 +200,7 @@ class gnn_loss_noatt(nn.Module):
         self.cls_f = cls_f
 
     def forward(self, preds, targets):
-        h, w = targets[0].size(1), targets[0].size(2)
+        h, w = targets[0].size(2), targets[0].size(3)
         # seg loss
         loss=[]
         for i in range(len(preds[0])-1):
@@ -215,7 +215,7 @@ class gnn_loss_noatt(nn.Module):
         lovasz_loss = lovasz_softmax_flat(*flatten_probas(pred, targets[0], self.ignore_index), only_present=self.only_present)
         loss.append(lovasz_loss)
         #ce loss
-        loss_ce = self.criterion(pred0, targets[0])
+        loss_ce = self.criterion(pred0, targets[0][:,0,:,:])
         loss.append(loss_ce)
         loss = sum(loss)
 
@@ -242,7 +242,7 @@ class gnn_loss_noatt(nn.Module):
         
         # dsn loss
         pred_dsn = F.interpolate(input=preds[-1], size=(h, w), mode='bilinear', align_corners=True)
-        loss_dsn = self.criterion(pred_dsn, targets[0])
+        loss_dsn = self.criterion(pred_dsn, targets[0][:,0,:,:])
 
         return (loss + 0.4 * loss_hb + 0.4 * loss_fb)/len(preds[1]) + 0.4 * loss_dsn
 

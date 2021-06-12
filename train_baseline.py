@@ -4,6 +4,7 @@ import random
 import sys
 import time
 
+import matplotlib.pyplot as plt
 import torch.backends.cudnn as cudnn
 import torch.optim as optim
 import torchvision
@@ -12,7 +13,8 @@ from torch.nn import functional as F
 from torch.nn.parallel.scatter_gather import gather
 from torch.utils import data
 
-from dataset.data_pascal import DataGenerator
+# from dataset.data_pascal import DataGenerator
+from dataset.dataset_tfrecord import define_dataset
 from network.baseline import get_model
 from progress.bar import Bar
 from utils.gnn_loss import gnn_loss_noatt as ABRLovaszLoss
@@ -25,6 +27,8 @@ from utils.visualize import inv_preprocess, decode_predictions
 def parse_args():
     parser = argparse.ArgumentParser(description='PyTorch Segmentation')
     parser.add_argument('--method', type=str, default='baseline')
+    parser.add_argument('--eval', type=bool, default=False)
+    parser.add_argument('--resume', type=bool, default=False)
     # Datasets
     parser.add_argument('--root', default='./data/Person', type=str)
     parser.add_argument('--val-root', default='./data/Person', type=str)
@@ -36,13 +40,14 @@ def parse_args():
     parser.add_argument('--fbody-cls', type=int, default=2)
     # Optimization options
     parser.add_argument('--epochs', default=150, type=int)
-    parser.add_argument('--batch-size', default=20, type=int)
-    parser.add_argument('--learning-rate', default=1e-2, type=float)
+    parser.add_argument('--batch-size', default=8, type=int)
+    parser.add_argument('--learning-rate', default=1e-4, type=float)
     parser.add_argument('--lr-mode', type=str, default='poly')
     parser.add_argument('--ignore-label', type=int, default=255)
     # Checkpoints
-    parser.add_argument('--restore-from', default='./checkpoints/init/resnet101_stem.pth', type=str)
+    parser.add_argument('--restore_from', default='gs://vinit_helper/grapy/hierarchical_human_parsing/exp_v2/baseline64_miou.pth', type=str, help='provide google cloud link')
     parser.add_argument('--snapshot_dir', type=str, default='./checkpoints/exp/')
+    parser.add_argument('--exp_path', type=str, default='gs://vinit_helper/grapy/hierarchical_human_parsing/exp_v2')
     parser.add_argument('--log-dir', type=str, default='./runs/')
     parser.add_argument('--init', action="store_true")
     parser.add_argument('--save-num', type=int, default=2)
@@ -80,42 +85,28 @@ def main(args):
     cudnn.benchmark = True
 
     # conduct seg network
-    seg_model = get_model(num_classes=args.num_classes)
+    model = get_model(num_classes=args.num_classes)
 
-    saved_state_dict = torch.load(args.restore_from)
-    new_params = seg_model.state_dict().copy()
+    if args.eval or args.resume:
+        restore_model_link = args.restore_from.split("/")[-1]
+        restore_model_link = os.path.join('/content/', restore_model_link)
 
-    if args.init:
-        for i in saved_state_dict:
-            i_parts = i.split('.')
-            if not i_parts[0] == 'fc':
-                new_params['encoder.' + '.'.join(i_parts[:])] = saved_state_dict[i]
-        seg_model.load_state_dict(new_params)
-        print('loading params w/o fc')
-    else:
-        seg_model.load_state_dict(saved_state_dict)
-        print('loading params all')
+        cmd = f"gsutil -m cp -r {args.restore_from} /content/"
+        if not os.path.exists(restore_model_link):
+            os.system(cmd)
 
-    model = DataParallelModel(seg_model)
+        model.load_state_dict(torch.load(restore_model_link, map_location='cpu'))
+
     model.float()
     model.cuda()
-
-    # define dataloader
-    train_loader = data.DataLoader(DataGenerator(root=args.root, list_path=args.lst,
-                                                    crop_size=args.crop_size, training=True),
-                                   batch_size=args.batch_size, shuffle=True, num_workers=4, pin_memory=True, drop_last=True)
-    val_loader = data.DataLoader(DataGenerator(root=args.val_root, list_path=args.val_lst,
-                                                  crop_size=args.crop_size, training=False),
-                                 batch_size=args.batch_size, shuffle=False, num_workers=4, pin_memory=True)
 
     # define criterion & optimizer
     criterion = ABRLovaszLoss(adj_matrix = torch.tensor(
             [[0, 1, 0, 0, 0, 0], [1, 0, 1, 0, 1, 0], [0, 1, 0, 1, 0, 0], [0, 0, 1, 0, 0, 0], [0, 1, 0, 0, 0, 1],
              [0, 0, 0, 0, 1, 0]]), ignore_index=args.ignore_label, only_present=True, upper_part_list=[1, 2, 3, 4], lower_part_list=[5, 6], cls_p= args.num_classes, cls_h= args.hbody_cls, cls_f= args.fbody_cls)
-    criterion = DataParallelCriterion(criterion).cuda()
 
     optimizer = optim.SGD(
-        [{'params': filter(lambda p: p.requires_grad, seg_model.parameters()), 'lr': args.learning_rate}],
+        [{'params': filter(lambda p: p.requires_grad, model.parameters()), 'lr': args.learning_rate}],
         lr=args.learning_rate, momentum=0.9, weight_decay=5e-4)
 
     # key points
@@ -123,56 +114,79 @@ def main(args):
     best_val_pixAcc = 0
     start = time.time()
 
-    for epoch in range(0, args.epochs):
-        print('\n{} | {}'.format(epoch, args.epochs - 1))
-        # training
-        _ = train(model, train_loader, epoch, criterion, optimizer, writer)
+    tfrecord_path = "gs://labelling-tools-data/tfrecords/person-tfrecord-v1.6_all_images.record"
+    trainset, trainset_length = define_dataset(tfrecord_path, args.batch_size, train=True)
+    valset, valset_length = define_dataset(tfrecord_path, args.batch_size, train=False)
 
-        # validation
-        if epoch %10 ==0 or epoch > args.epochs-10:
-            val_pixacc, val_miou = validation(model, val_loader, epoch, writer)
-            # save model
-            if val_pixacc > best_val_pixAcc:
-                best_val_pixAcc = val_pixacc
-            if val_miou > best_val_mIoU:
-                best_val_mIoU = val_miou
-                model_dir = os.path.join(args.snapshot_dir, args.method + '_miou.pth')
-                torch.save(seg_model.state_dict(), model_dir)
+    print("Training Volume", trainset_length)
+    print("Validation Volume", valset_length)
+    exp_path = args.exp_path
+
+    if args.eval == True:
+        valpath = os.path.join(args.snapshot_dir, 'test')
+        if not os.path.exists(valpath):
+            os.makedirs(valpath)
+        validation(model, valset, 0, args.batch_size, valset_length, valpath, exp_path)
+    else:
+        for epoch in range(0, args.epochs):
+            print('\n{} | {}'.format(epoch, args.epochs - 1))
+            # training
+            _ = train(model, trainset, epoch, criterion, optimizer, writer, args.batch_size, trainset_length)
+
+            if epoch%5 == 0:
+                valpath = os.path.join(args.snapshot_dir, 'val_'+str(epoch))
+                if not os.path.exists(valpath):
+                    os.makedirs(valpath)
+                validation(model, valset, epoch, args.batch_size, valset_length, valpath, exp_path)
+
+            if epoch%2 == 0:
+                model_dir = os.path.join(args.snapshot_dir, args.method + str(epoch) + '_miou.pth')
+                torch.save(model.state_dict(), model_dir)
                 print('Model saved to %s' % model_dir)
 
-    os.rename(model_dir, os.path.join(args.snapshot_dir, args.method + '_miou'+str(best_val_mIoU)+'.pth'))
-    print('Complete using', time.time() - start, 'seconds')
-    print('Best pixAcc: {} | Best mIoU: {}'.format(best_val_pixAcc, best_val_mIoU))
+                cmd = f"gsutil -m cp -r {model_dir} {exp_path}"
+                os.system(cmd)
 
 
-def train(model, train_loader, epoch, criterion, optimizer, writer):
+def train(model, trainset, epoch, criterion, optimizer, writer, batch_size, trainset_length):
     # set training mode
     model.train()
     train_loss = 0.0
     iter_num = 0
 
-    # Iterate over data.
-    # bar = Bar('Processing | {}'.format('train'), max=len(train_loader))
-    # bar.check_tty = False
     from tqdm import tqdm
-    tbar = tqdm(train_loader)
-    for i_iter, batch in enumerate(tbar):
+
+    train_iterator = iter(trainset)
+    num_iterations = int(trainset_length/batch_size)
+
+    tbar = tqdm(range(num_iterations))
+    for i_iter in tbar:
         sys.stdout.flush()
         start_time = time.time()
         iter_num += 1
         # adjust learning rate
-        iters_per_epoch = len(train_loader)
+        iters_per_epoch = trainset_length
         lr = adjust_learning_rate(optimizer, epoch, i_iter, iters_per_epoch, method=args.lr_mode)
-        # print("\n=>epoch  %d, learning_rate = %f" % (epoch, lr))
-        image, label, hlabel, flabel, _ = batch
-        images, labels, hlabel, flabel = image.cuda(), label.long().cuda(), hlabel.cuda(), flabel.cuda()
+
+        image, data = next(train_iterator)
+        labels = data['segmentations']
+        hlabel = data['segmentations_half']
+        flabel = data['segmentations_full']
+
+        image = torch.tensor(image.numpy()).permute(0, 3, 1, 2)
+        labels = torch.tensor(labels.numpy()).permute(0, 3, 1, 2)
+        hlabel = torch.tensor(hlabel.numpy()).permute(0, 3, 1, 2)
+        flabel = torch.tensor(flabel.numpy()).permute(0, 3, 1, 2)
+
+        image, labels, hlabel, flabel = image.cuda(), labels.long().cuda(), hlabel.cuda(), flabel.cuda()
         torch.set_grad_enabled(True)
 
         # zero the parameter gradients
         optimizer.zero_grad()
 
         # compute output loss
-        preds = model(images)
+        # import pdb; pdb.set_trace()
+        preds = model(image)
         loss = criterion(preds, [labels, hlabel, flabel])  # batch mean
         train_loss += loss.item()
 
@@ -181,12 +195,12 @@ def train(model, train_loader, epoch, criterion, optimizer, writer):
         optimizer.step()
 
         if i_iter % 10 == 0:
-            writer.add_scalar('learning_rate', lr, iter_num + epoch * len(train_loader))
-            writer.add_scalar('train_loss', train_loss / iter_num, iter_num + epoch * len(train_loader))
+            writer.add_scalar('learning_rate', lr, iter_num + epoch * trainset_length)
+            writer.add_scalar('train_loss', train_loss / iter_num, iter_num + epoch * trainset_length)
 
         batch_time = time.time() - start_time
         # plot progress
-        tbar.set_description('{} / {} | Time: {batch_time:.4f} | Loss: {loss:.4f}'.format(iter_num, len(train_loader),
+        tbar.set_description('{} / {} | Time: {batch_time:.4f} | Loss: {loss:.4f}'.format(iter_num, trainset_length,
                                                                                   batch_time=batch_time,
                                                                                   loss=train_loss / iter_num))
         # bar.suffix = '{} / {} | Time: {batch_time:.4f} | Loss: {loss:.4f}'.format(iter_num, len(train_loader),
@@ -202,95 +216,66 @@ def train(model, train_loader, epoch, criterion, optimizer, writer):
     return epoch_loss
 
 
-def validation(model, val_loader, epoch, writer):
+def validation(model, valset, epoch, batch_size, valset_length, valpath, exp_path):
+
     # set evaluate mode
     model.eval()
 
-    total_correct, total_label = 0, 0
-    total_correct_hb, total_label_hb = 0, 0
-    total_correct_fb, total_label_fb = 0, 0
-    hist = np.zeros((args.num_classes, args.num_classes))
-    hist_hb = np.zeros((args.hbody_cls, args.hbody_cls))
-    hist_fb = np.zeros((args.fbody_cls, args.fbody_cls))
-
     # Iterate over data.
     from tqdm import tqdm
-    tbar = tqdm(val_loader)
-    for idx, batch in enumerate(tbar):
-        image, target, hlabel, flabel, _ = batch
+
+    val_iterator = iter(valset)
+    num_iterations = int(valset_length/batch_size)
+    tbar = tqdm(range(num_iterations))
+
+    for idx in tbar:
+        # image, target, hlabel, flabel, _ = batch
+
+        image, data = next(val_iterator)
+        target = data['segmentations']
+        hlabel = data['segmentations_half']
+        flabel = data['segmentations_full']
+
+        image = torch.tensor(image.numpy()).permute(0, 3, 1, 2)
+        target = torch.tensor(target.numpy()).permute(0, 3, 1, 2)
+        hlabel = torch.tensor(hlabel.numpy()).permute(0, 3, 1, 2)
+        flabel = torch.tensor(flabel.numpy()).permute(0, 3, 1, 2)
+
         image, target, hlabel, flabel = image.cuda(), target.cuda(), hlabel.cuda(), flabel.cuda()
         with torch.no_grad():
-            h, w = target.size(1), target.size(2)
+            h, w = target.size(2), target.size(3)
             outputs = model(image)
-            outputs = gather(outputs, 0, dim=0)
+            # outputs = gather(outputs, 0, dim=0)
             preds = F.interpolate(input=outputs[0][-1], size=(h, w), mode='bilinear', align_corners=True)
             preds_hb = F.interpolate(input=outputs[1][-1], size=(h, w), mode='bilinear', align_corners=True)
             preds_fb = F.interpolate(input=outputs[2][-1], size=(h, w), mode='bilinear', align_corners=True)
-            # if idx % 50 == 0:
-            #     img_vis = inv_preprocess(image, num_images=args.save_num)
-            #     label_vis = decode_predictions(target.int(), num_images=args.save_num, num_classes=args.num_classes)
-            #     pred_vis = decode_predictions(torch.argmax(preds, dim=1), num_images=args.save_num,
-            #                                   num_classes=args.num_classes)
 
-            #     # visual grids
-            #     img_grid = torchvision.utils.make_grid(torch.from_numpy(img_vis.transpose(0, 3, 1, 2)))
-            #     label_grid = torchvision.utils.make_grid(torch.from_numpy(label_vis.transpose(0, 3, 1, 2)))
-            #     pred_grid = torchvision.utils.make_grid(torch.from_numpy(pred_vis.transpose(0, 3, 1, 2)))
-            #     writer.add_image('val_images', img_grid, epoch * len(val_loader) + idx + 1)
-            #     writer.add_image('val_labels', label_grid, epoch * len(val_loader) + idx + 1)
-            #     writer.add_image('val_preds', pred_grid, epoch * len(val_loader) + idx + 1)
+            preds = torch.argmax(preds, 1)[0]
+            preds_hb = torch.argmax(preds_hb, 1)[0]
+            preds_fb = torch.argmax(preds_fb, 1)[0]
 
-            # pixelAcc
-            correct, labeled = batch_pix_accuracy(preds.data, target)
-            correct_hb, labeled_hb = batch_pix_accuracy(preds_hb.data, hlabel)
-            correct_fb, labeled_fb = batch_pix_accuracy(preds_fb.data, flabel)
-            # mIoU
-            hist += fast_hist(preds, target, args.num_classes)
-            hist_hb += fast_hist(preds_hb, hlabel, args.hbody_cls)
-            hist_fb += fast_hist(preds_fb, flabel, args.fbody_cls)
+            fig = plt.figure(figsize=(12,10))
+            plt.subplot(2,3,1)
+            plt.imshow(image.permute(0, 2, 3, 1)[0].detach().cpu().numpy()*0.5+0.5)
+            plt.title('Input Image', fontsize=20)
+            plt.subplot(2,3,2)
+            plt.imshow(preds.detach().cpu().numpy())
+            plt.title('Predicted Grapy', fontsize=20)
+            plt.subplot(2,3,3)
+            plt.imshow(target.detach().cpu().numpy()[0,0,:,:])
+            plt.title('Ground Truth Grapy', fontsize=20)
+            plt.subplot(2,3,5)
+            plt.imshow(preds_fb.detach().cpu().numpy())
+            plt.title('Predicted Grapy Silhouette', fontsize=20)
+            plt.subplot(2,3,6)
+            plt.imshow(preds_hb.detach().cpu().numpy())
+            plt.title('Predicted Half Grapy', fontsize=20)
 
-            total_correct += correct
-            total_correct_hb += correct_hb
-            total_correct_fb += correct_fb
-            total_label += labeled
-            total_label_hb += labeled_hb
-            total_label_fb += labeled_fb
-            pixAcc = 1.0 * total_correct / (np.spacing(1) + total_label)
-            IoU = round(np.nanmean(per_class_iu(hist)) * 100, 2)
-            pixAcc_hb = 1.0 * total_correct_hb / (np.spacing(1) + total_label_hb)
-            IoU_hb = round(np.nanmean(per_class_iu(hist_hb)) * 100, 2)
-            pixAcc_fb = 1.0 * total_correct_fb / (np.spacing(1) + total_label_fb)
-            IoU_fb = round(np.nanmean(per_class_iu(hist_fb)) * 100, 2)
-            # plot progress
-            tbar.set_description('{} / {} | {pixAcc:.4f}, {IoU:.4f} |' \
-                         '{pixAcc_hb:.4f}, {IoU_hb:.4f} |' \
-                         '{pixAcc_fb:.4f}, {IoU_fb:.4f}'.format(idx + 1, len(val_loader), pixAcc=pixAcc, IoU=IoU,pixAcc_hb=pixAcc_hb, IoU_hb=IoU_hb,pixAcc_fb=pixAcc_fb, IoU_fb=IoU_fb))
-            # bar.suffix = '{} / {} | pixAcc: {pixAcc:.4f}, mIoU: {IoU:.4f} |' \
-            #              'pixAcc_hb: {pixAcc_hb:.4f}, mIoU_hb: {IoU_hb:.4f} |' \
-            #              'pixAcc_fb: {pixAcc_fb:.4f}, mIoU_fb: {IoU_fb:.4f}'.format(idx + 1, len(val_loader),
-            #                                                                         pixAcc=pixAcc, IoU=IoU,
-            #                                                                         pixAcc_hb=pixAcc_hb, IoU_hb=IoU_hb,
-            #                                                                         pixAcc_fb=pixAcc_fb, IoU_fb=IoU_fb)
-            # bar.next()
-
-    print('\n per class iou part: {}'.format(per_class_iu(hist)*100))
-    print('per class iou hb: {}'.format(per_class_iu(hist_hb)*100))
-    print('per class iou fb: {}'.format(per_class_iu(hist_fb)*100))
-
-    mIoU = round(np.nanmean(per_class_iu(hist)) * 100, 2)
-    mIoU_hb = round(np.nanmean(per_class_iu(hist_hb)) * 100, 2)
-    mIoU_fb = round(np.nanmean(per_class_iu(hist_fb)) * 100, 2)
-
-    writer.add_scalar('val_pixAcc', pixAcc, epoch)
-    writer.add_scalar('val_mIoU', mIoU, epoch)
-    writer.add_scalar('val_pixAcc_hb', pixAcc_hb, epoch)
-    writer.add_scalar('val_mIoU_hb', mIoU_hb, epoch)
-    writer.add_scalar('val_pixAcc_fb', pixAcc_fb, epoch)
-    writer.add_scalar('val_mIoU_fb', mIoU_fb, epoch)
-    # bar.finish()
-    tbar.close()
+            plt.savefig(os.path.join(valpath, str(idx)+'.png'))
+            plt.close(fig)
     
-    return pixAcc, mIoU
+    cmd = f"gsutil -m cp -r {valpath} {exp_path}"
+    os.system(cmd)
 
 
 if __name__ == '__main__':
