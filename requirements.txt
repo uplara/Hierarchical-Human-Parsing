@@ -3,3 +3,5 @@ torchvision==0.4.0
 numpy
 opencv-python
 tqdm
+ninja
+tensorboardX
